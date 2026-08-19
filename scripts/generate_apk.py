@@ -134,15 +134,65 @@ def update_dtunnelmod_json(work_dir: Path, new_domain: str) -> None:
         print(f"Aviso: erro ao atualizar dtunnelmod.json: {e}")
 
 def update_app_name(work_dir: Path, new_name: str) -> None:
-    strings_xml = work_dir / "res" / "values" / "strings.xml"
-    if not strings_xml.is_file():
-        return
-    content = strings_xml.read_text(encoding="utf-8")
-    safe_name = xml_escape(new_name.strip())
-    updated, count = re.subn(r'(<string name="app_name">).*?(</string>)', rf'\1{safe_name}\2', content, count=1)
-    if count:
-        strings_xml.write_text(updated, encoding="utf-8")
-    print(f"Nome do app atualizado para: {new_name}")
+    clean_name = new_name.strip()
+    if not clean_name:
+        raise ValueError("Informe um nome de aplicativo válido.")
+
+    safe_name = xml_escape(clean_name)
+    pattern = re.compile(r'(<string\b(?=[^>]*\bname="app_name")[^>]*>).*?(</string>)', re.DOTALL)
+    replacements = 0
+    for strings_xml in sorted((work_dir / "res").glob("values*/strings*.xml")):
+        if not strings_xml.is_file():
+            continue
+        content = strings_xml.read_text(encoding="utf-8")
+        updated, count = pattern.subn(rf'\1{safe_name}\2', content)
+        if count:
+            strings_xml.write_text(updated, encoding="utf-8")
+            replacements += count
+
+    if replacements == 0:
+        raise RuntimeError("A APK base não possui um recurso app_name substituível; geração interrompida para evitar um rótulo fixo.")
+
+    manifest = work_dir / "AndroidManifest.xml"
+    manifest_replacements = 0
+    if manifest.is_file():
+        manifest_content = manifest.read_text(encoding="utf-8")
+        label_pattern = re.compile(r'(android:label=")(?!@string/app_name)([^\"]*)(")')
+        manifest_content, manifest_replacements = label_pattern.subn(rf'\1{safe_name}\3', manifest_content)
+        if manifest_replacements:
+            manifest.write_text(manifest_content, encoding="utf-8")
+
+    if replacements == 0 and manifest_replacements == 0:
+        raise RuntimeError("A APK base não possui app_name nem android:label substituível; geração interrompida para evitar um rótulo fixo.")
+
+    print(f"Nome interno do app atualizado para: {clean_name} ({replacements} recurso(s), {manifest_replacements} label(s) no manifest).")
+
+
+def validate_app_name(work_dir: Path, expected_name: str) -> None:
+    expected = expected_name.strip()
+    if not expected:
+        raise ValueError("Nome do aplicativo vazio após a normalização.")
+    expected_xml = xml_escape(expected)
+    found_resource = False
+    for strings_xml in sorted((work_dir / "res").glob("values*/strings*.xml")):
+        if not strings_xml.is_file():
+            continue
+        content = strings_xml.read_text(encoding="utf-8")
+        if re.search(rf'<string\b(?=[^>]*\bname="app_name")[^>]*>\s*{re.escape(expected_xml)}\s*</string>', content, re.DOTALL):
+            found_resource = True
+            break
+
+    manifest = work_dir / "AndroidManifest.xml"
+    if not manifest.is_file():
+        raise RuntimeError("A APK não possui AndroidManifest.xml para validar o nome interno.")
+    manifest_content = manifest.read_text(encoding="utf-8")
+    literal_labels = re.findall(r'android:label="([^\"]*)"', manifest_content)
+    invalid_labels = [label for label in literal_labels if label != expected_xml and label != "@string/app_name"]
+    application_match = re.search(r'<application\b[^>]*android:label="([^\"]*)"', manifest_content, re.DOTALL)
+    application_label = application_match.group(1) if application_match else None
+    application_ok = application_label in {expected_xml, "@string/app_name"}
+    if (not found_resource and not application_ok) or invalid_labels or not application_ok:
+        raise RuntimeError("A validação encontrou um android:label fixo diferente do nome informado; geração interrompida.")
 
 def download_icon(icon_url: str) -> bytes:
     """Baixa o ícone com retries e User-Agent de navegador, validando que é uma imagem válida."""
@@ -287,17 +337,83 @@ def update_manifest_package(work_dir: Path, new_package: str) -> None:
 
 def update_version(work_dir: Path, version_name: str | None, version_code: str | None) -> None:
     apktool_yml = work_dir / "apktool.yml"
-    if not apktool_yml.is_file():
-        return
-    content = apktool_yml.read_text(encoding="utf-8")
-    if version_name:
-        content = re.sub(r'versionName:.*', f'versionName: {version_name}', content)
-    if version_code:
-        normalized_code = str(version_code).strip()
-        if not normalized_code.isdigit() or int(normalized_code) < 1:
-            raise ValueError("O código da versão deve ser um número inteiro positivo.")
+    old_version_name = None
+    old_version_code = None
+    content = apktool_yml.read_text(encoding="utf-8") if apktool_yml.is_file() else ""
+    old_name_match = re.search(r'^\s*versionName:\s*(.+?)\s*$', content, re.MULTILINE)
+    old_code_match = re.search(r'^\s*versionCode:\s*(\d+)\s*$', content, re.MULTILINE)
+    if old_name_match:
+        old_version_name = old_name_match.group(1).strip()
+    if old_code_match:
+        old_version_code = int(old_code_match.group(1))
+
+    clean_name = str(version_name).strip() if version_name else None
+    if clean_name and ("\n" in clean_name or '"' in clean_name):
+        raise ValueError("O nome da versão contém caracteres inválidos.")
+    normalized_code = str(version_code).strip() if version_code else None
+    if normalized_code and (not normalized_code.isdigit() or int(normalized_code) < 1):
+        raise ValueError("O código da versão deve ser um número inteiro positivo.")
+
+    if clean_name and apktool_yml.is_file():
+        content = re.sub(r'versionName:.*', f'versionName: {clean_name}', content)
+    if normalized_code and apktool_yml.is_file():
         content = re.sub(r'versionCode:.*', f"versionCode: {normalized_code}", content)
-    apktool_yml.write_text(content, encoding="utf-8")
+    if apktool_yml.is_file():
+        apktool_yml.write_text(content, encoding="utf-8")
+
+    if not clean_name and not normalized_code:
+        return
+
+    # O cliente exibe a versão no bloco LBL_APP_VERSION. Algumas bases
+    # mantêm nome/código antigos em Smali, além do metadata do APK.
+    legacy_versions = {value for value in (old_version_name, "4.5.7", "4.5.8") if value}
+    if clean_name:
+        for smali_file in work_dir.glob("smali*/**/*.smali"):
+            smali_content = smali_file.read_text(encoding="utf-8")
+            updated = smali_content
+            for legacy in legacy_versions:
+                updated = updated.replace(f'"DTunnel v{legacy}"', f'"DTunnel v{clean_name}"')
+                updated = updated.replace(f'"{legacy}"', f'"{clean_name}"')
+            if updated != smali_content:
+                smali_file.write_text(updated, encoding="utf-8")
+
+        app_config = work_dir / "assets" / "app_config.json"
+        if app_config.is_file():
+            try:
+                data = json.loads(app_config.read_text(encoding="utf-8"))
+                entries = data.get("content", []) if isinstance(data, dict) else data
+                changed = False
+                for item in entries if isinstance(entries, list) else []:
+                    if isinstance(item, dict) and item.get("name") == "APP_CURRENT_VERSION":
+                        item["value"] = clean_name
+                        changed = True
+                if changed:
+                    app_config.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            except (OSError, json.JSONDecodeError):
+                pass
+
+    if normalized_code and old_version_code is not None:
+        old_hex = f"0x{old_version_code:x}"
+        new_hex = f"0x{int(normalized_code):x}"
+        for smali_file in work_dir.glob("smali*/**/*.smali"):
+            smali_content = smali_file.read_text(encoding="utf-8")
+            if "LBL_APP_VERSION" not in smali_content:
+                continue
+            marker = smali_content.find('const-string v6, "LBL_APP_VERSION"')
+            if marker < 0:
+                marker = smali_content.find('LBL_APP_VERSION')
+            window_start = max(0, marker - 1800)
+            window = smali_content[window_start:marker]
+            matches = list(re.finditer(rf'const/(?:4|16) (v\d+), {re.escape(old_hex)}', window, re.IGNORECASE))
+            if not matches:
+                continue
+            match = matches[-1]
+            replacement = f"const/16 {match.group(1)}, {new_hex}"
+            absolute_start = window_start + match.start()
+            absolute_end = window_start + match.end()
+            updated = smali_content[:absolute_start] + replacement + smali_content[absolute_end:]
+            smali_file.write_text(updated, encoding="utf-8")
+            break
 
 def fix_foreground_service_type(work_dir: Path) -> None:
     manifest = work_dir / "AndroidManifest.xml"
@@ -341,6 +457,7 @@ def generate_apk(args: argparse.Namespace) -> Path:
         
         if args.name:
             update_app_name(work_dir, args.name)
+            validate_app_name(work_dir, args.name)
         
         if args.icon:
             print(f"Aplicando ícone customizado: {args.icon[:80]}")
